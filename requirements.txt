@@ -1,0 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/lts/1.8/cu102
+torch==1.8.2
+torchvision==0.9.2
+torchaudio==0.8.2
+kornia
+pyyaml==5.3.1
+scipy==1.6.2
+tensorboard==2.4.1
+tqdm==4.60.0
+lpips==0.1.4
+opencv-python==4.5.1.48
+protobuf==3.20.3
+matplotlib
