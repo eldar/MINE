@@ -221,6 +221,9 @@ class VideoGenerator:
             tgt_disp_np_list.append(tgt_disp_np)
 
             imwrite(self.output_dir / f"{frame.seq_id}.{frame.name}.pred.jpg", tgt_img_np)
+
+        # save GT images
+        for frame in frames:
             imwrite(self.output_dir / f"{frame.seq_id}.{frame.name}.gt.jpg", self.resize(imread(frame.image_file)))
 
 
@@ -283,14 +286,16 @@ def main():
     samples = create_test_set(split)
 
     with torch.no_grad():
-        frames = samples[1100]
-        # load source image
-        img = imread(frames[0].image_file)
-        img = predictor.resize(img)
-        img = torch.from_numpy(img).cuda().permute(2, 0, 1).contiguous().unsqueeze(0) / 255.0
-        tgts_poses = predictor.traj_generation(frames)
-        predictor.infer_network(img, frames)
-        predictor.render_views(frames, tgts_poses)
+        for frames in tqdm(samples):
+            # load source image
+            if not frames[0].image_file.exists():
+                continue
+            img = imread(frames[0].image_file)
+            img = predictor.resize(img)
+            img = torch.from_numpy(img).cuda().permute(2, 0, 1).contiguous().unsqueeze(0) / 255.0
+            tgts_poses = predictor.traj_generation(frames)
+            predictor.infer_network(img, frames)
+            predictor.render_views(frames, tgts_poses)
 
 
 if __name__ == '__main__':
