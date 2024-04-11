@@ -71,9 +71,9 @@ def load_test_split():
 
 Frame = namedtuple('Frame', ['seq_id', 'name', 'timestamp', 'image_file', 'K', 'w2c'])
 
-def create_test_set(split):
+def create_test_set(data_path, split):
     mode = "test"
-    dataset_path = Path("/scratch/shared/nfs1/eldar/data/realestate10k")
+    dataset_path = Path(data_path)
     samples = []
     for sample in split:
         seq_id = sample["sequence_id"]
@@ -273,17 +273,14 @@ def main():
 
     config["logger"] = logger
     config["tb_writer"] = None  # SummaryWriter(args.output_dir)
-    config["data.val_set_path"] = args.data_path
     config["data.per_gpu_batch_size"] = 1
 
     synthesis_task = SynthesisTask(config=config, logger=logger, is_val=True)
 
-    img_np = cv2.imread(args.data_path, cv2.IMREAD_COLOR)
-    img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
     predictor = VideoGenerator(synthesis_task, config, config["logger"], args.output_dir)
 
     split = load_test_split()
-    samples = create_test_set(split)
+    samples = create_test_set(args.data_path, split)
 
     with torch.no_grad():
         for frames in tqdm(samples):
