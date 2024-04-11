@@ -69,7 +69,7 @@ def load_test_split():
     return split_data
 
 
-Frame = namedtuple('Frame', ['name', 'timestamp', 'image_file', 'K', 'w2c'])
+Frame = namedtuple('Frame', ['seq_id', 'name', 'timestamp', 'image_file', 'K', 'w2c'])
 
 def create_test_set(split):
     mode = "test"
@@ -128,21 +128,7 @@ class VideoGenerator:
         self.synthesis_task.backbone.eval()
         self.synthesis_task.decoder.eval()
 
-        split = load_test_split()
-        samples = create_test_set(split)
-        frames = samples[1100]
-        self.frames = frames
-
-        # load source image
-        img = imread(frames[0].image_file)
-        img = self.resize(img)
-
-        self.img = torch.from_numpy(img).cuda().permute(2, 0, 1).contiguous().unsqueeze(0) / 255.0
-
         self.output_dir = Path(output_dir)
-        self.tgts_poses = self.traj_generation(frames)
-
-        self.infer_network(frames)
 
     def resize(self, img):
         W, H = self.config["data.img_w"], self.config["data.img_h"]
@@ -159,27 +145,29 @@ class VideoGenerator:
             tgts_poses += [tgt_src]
         return tgts_poses
 
-    def infer_network(self, frames):
-        B, _, H, W = self.img.size()
+    def infer_network(self, img, frames):
+        device = img.device
+
+        B, _, H, W = img.size()
         
         src_frame = frames[0]
 
-        K = torch.from_numpy(src_frame.K.copy()).unsqueeze(0).to(self.img.device)
+        K = torch.from_numpy(src_frame.K.copy()).unsqueeze(0).to(device)
         K[:, 0, :] *= W
         K[:, 1, :] *= H
-        K_inv = torch.inverse(K).to(self.img.device)
+        K_inv = torch.inverse(K).to(device)
         self.K, self.K_inv = K, K_inv
 
         N_pt = 128
 
         src_items = {
-            "img": self.img,
+            "img": img,
             "K": self.K,
             "K_inv": self.K_inv,
             "xyzs": torch.ones((B, 3, N_pt), dtype=torch.float32)
         }
         tgt_items = {
-            "img": self.img.unsqueeze(1),
+            "img": img.unsqueeze(1),
             "K": self.K.unsqueeze(1),
             "K_inv": self.K_inv.unsqueeze(1),
             "xyzs": torch.ones((B, 1, 3, N_pt), dtype=torch.float32),
@@ -196,7 +184,7 @@ class VideoGenerator:
         xyz_src_BS3HW = mpi_rendering.get_src_xyz_from_plane_disparity(
             self.synthesis_task.homography_sampler_list[0].meshgrid,
             self.disparity_all_src,
-            self.K_inv.to(self.img.device)
+            self.K_inv.to(img.device)
         )
         self.mpi_all_rgb_src = mpi_all_src[:, :, 0:3, :, :]  # BxSx3xHxW
         self.mpi_all_sigma_src = mpi_all_src[:, :, 3:, :, :]  # BxSx1xHxW
@@ -207,15 +195,13 @@ class VideoGenerator:
             use_alpha=self.config.get("mpi.use_alpha", False),
             is_bg_depth_inf=self.config.get("mpi.render_tgt_rgb_depth", False)
         )
-        self.mpi_all_rgb_src = blend_weights * self.img.unsqueeze(1) + (1 - blend_weights) * self.mpi_all_rgb_src
+        self.mpi_all_rgb_src = blend_weights * img.unsqueeze(1) + (1 - blend_weights) * self.mpi_all_rgb_src
 
-    def render_video(self):
-        poses = self.tgts_poses
+    def render_views(self, frames, poses):
         tgt_img_np_list = []
         tgt_disp_np_list = []
-        for frame, pose in zip(self.frames[1:], poses):
-            print(frame.name)
-            G_tgt_src = pose.unsqueeze(0).to(self.img.device)
+        for frame, pose in zip(frames[1:], poses):
+            G_tgt_src = pose.unsqueeze(0).to(self.mpi_all_rgb_src.device)
 
             render_results = self.synthesis_task.render_novel_view(
                 self.mpi_all_rgb_src,
@@ -234,8 +220,8 @@ class VideoGenerator:
             tgt_img_np_list.append(tgt_img_np)
             tgt_disp_np_list.append(tgt_disp_np)
 
-            imwrite(self.output_dir / f"{frame.name}_pred.jpg", tgt_img_np)
-            imwrite(self.output_dir / f"{frame.name}_gt.jpg", self.resize(imread(frame.image_file)))
+            imwrite(self.output_dir / f"{frame.seq_id}.{frame.name}.pred.jpg", tgt_img_np)
+            imwrite(self.output_dir / f"{frame.seq_id}.{frame.name}.gt.jpg", self.resize(imread(frame.image_file)))
 
 
 def main():
@@ -291,13 +277,20 @@ def main():
 
     img_np = cv2.imread(args.data_path, cv2.IMREAD_COLOR)
     img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-    video_generator = VideoGenerator(synthesis_task, config, config["logger"], args.output_dir)
+    predictor = VideoGenerator(synthesis_task, config, config["logger"], args.output_dir)
 
-    # split = load_test_split()
-    # samples = create_test_set(split)
+    split = load_test_split()
+    samples = create_test_set(split)
 
     with torch.no_grad():
-        video_generator.render_video()
+        frames = samples[1100]
+        # load source image
+        img = imread(frames[0].image_file)
+        img = predictor.resize(img)
+        img = torch.from_numpy(img).cuda().permute(2, 0, 1).contiguous().unsqueeze(0) / 255.0
+        tgts_poses = predictor.traj_generation(frames)
+        predictor.infer_network(img, frames)
+        predictor.render_views(frames, tgts_poses)
 
 
 if __name__ == '__main__':
