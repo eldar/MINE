@@ -6,15 +6,17 @@ import argparse
 import logging
 import math
 import json
-import shutil
+import gzip
+import pickle
 import pdb
 
+from tqdm import tqdm
 import numpy as np
 from imageio.v3 import imread, imwrite
 import cv2
 import yaml
 import torch
-from tqdm import tqdm
+import torch.nn.functional as F
 
 from synthesis_task import SynthesisTask
 from operations import mpi_rendering
@@ -59,8 +61,52 @@ def write_img_to_disk(img_tensor, step, postfix, output_dir):
                         img_np_BHWC_255[b, :, :, 0])
 
 
-def load_test_split():
-    mode = "test"
+def get_w2c_4x4(pose):
+    w2c = np.concatenate((pose.astype(np.float32),
+            np.array([[0, 0, 0, 1]], dtype=np.float32)), axis=0)
+    return w2c
+
+
+def estimate_depth_scale(depth, sparse_depth):
+    """
+    depth: [1, 1, H, W]
+    sparse_depth: [N, 3]
+    """
+    eps = 1e-7
+    device = depth.device
+    sparse_depth = sparse_depth.to(device)
+    if sparse_depth.shape[0] < 10:
+        return torch.tensor(1.0, device=device, dtype=torch.float32)
+    xy = sparse_depth[:, :2]
+    z = sparse_depth[:, 2]
+    xy = xy.unsqueeze(0).unsqueeze(0)
+    depth_pred = F.grid_sample(depth, xy.to(depth.device), align_corners=False)
+    depth_pred = depth_pred.squeeze()
+    # z = torch.max(z, torch.tensor(eps, dtype=z.dtype, device=z.device))
+    good_depth = z > eps
+    z = z[good_depth]
+    depth_pred = depth_pred[good_depth]
+
+    if z.shape[0] < 10:
+        return torch.tensor(1.0, device=device, dtype=torch.float32)
+
+    scale = (depth_pred.log() - z.log()).mean().exp()
+
+    # if torch.any(torch.isnan(depth_pred.log())):
+    #     print("pred is NaN")
+        # pdb.set_trace()
+    # if torch.any(torch.isnan(z.log())):
+    #     print("gt is NaN")
+        # pdb.set_trace()
+        # assert False, "gt is NaN"
+
+    # if torch.any(torch.isnan(scale)):
+    #     print("logit", (depth_pred.log() - z.log()).mean())
+    #     assert False, "scale is NaN"
+    return scale
+
+
+def load_test_split(mode):
     split_path = Path("configs/input_pipelines/realestate10k/test_data_jsons")
     split_file_name = "test_pairs.json" if mode == "test" else "validation_pairs.json"
     with open(split_path / split_file_name, "r") as f:
@@ -117,17 +163,19 @@ def create_test_set(data_path, split):
     return samples
 
 
-class VideoGenerator:
-    def __init__(self, synthesis_task, config, logger, output_dir):
+class Predictor:
+    def __init__(self, synthesis_task, config, seq_data, mode, output_dir):
         self.synthesis_task = synthesis_task
         self.config = config
-        self.logger = logger
 
         self.synthesis_task.global_step = config["training.eval_interval"]
         self.synthesis_task.logger.info("Start running evaluation on validation set:")
         self.synthesis_task.backbone.eval()
         self.synthesis_task.decoder.eval()
 
+        self.seq_data = seq_data
+        self.mode = mode
+        self.data_path = Path(config["data.path"])
         self.output_dir = Path(output_dir)
 
     def resize(self, img):
@@ -145,7 +193,12 @@ class VideoGenerator:
             tgts_poses += [tgt_src]
         return tgts_poses
 
-    def infer_network(self, img, frames):
+    def infer_network(self, frames):
+        img = imread(frames[0].image_file)
+        orig_size = img.shape[:2]
+        img = self.resize(img)
+        img = torch.from_numpy(img).cuda().permute(2, 0, 1).contiguous().unsqueeze(0) / 255.0
+
         device = img.device
 
         B, _, H, W = img.size()
@@ -197,9 +250,56 @@ class VideoGenerator:
         )
         self.mpi_all_rgb_src = blend_weights * img.unsqueeze(1) + (1 - blend_weights) * self.mpi_all_rgb_src
 
+        # get sparse depth map from COLMAP
+        seq_id = src_frame.seq_id
+        pcl_file = self.data_path / "pcl" / self.mode / seq_id / "pcl.pickle"
+        with gzip.open(pcl_file, "rb") as f:
+            sparse_pcl = pickle.load(f)
+        pose_data = self.seq_data[seq_id]
+        frame_idx = np.where(pose_data["timestamps"] == src_frame.timestamp)[0].item()
+        xyd = self.get_sparse_depth(pose_data, orig_size, sparse_pcl, frame_idx)
+        self.scale_factor = estimate_depth_scale(src_depth_syn, xyd)
+
+    @staticmethod
+    def get_sparse_depth(pose_data, orig_size, sparse_pcl, frame_idx):
+        # image_id-1 == frame_idx
+        xys_all = sparse_pcl["xys"]
+        p3D_ids_all = sparse_pcl["p3D_ids"]
+        xyz = sparse_pcl["xyz"]
+
+        xys = xys_all[frame_idx]
+        p3D_ids = p3D_ids_all[frame_idx]
+
+        H, W = orig_size
+
+        visible_points = p3D_ids != -1
+        xys = xys[visible_points, :]
+        p3D_ids = p3D_ids[visible_points]
+
+        xyz_image = xyz[p3D_ids, :]
+        xyz_image_h = np.hstack((xyz_image, np.ones_like(xyz_image[:, :1])))
+
+        # ===== compute point projections onto image with network data ====
+        # index to -1 because image_ids are 1-indexed
+        # K = _process_projs(pose_data["intrinsics"][image_id-1], H, W)
+        # load the extrinsic matrixself.num_scales
+        T_w2c = get_w2c_4x4(pose_data["poses"][frame_idx])
+        # P = K @ T_w2c
+        xyz_pix = np.einsum("ji,ni->nj", T_w2c, xyz_image_h)[:, :3]
+        depth = xyz_pix[:, 2:]
+        img_dim = np.array([[W, H]])
+        xys_scaled = (xys / img_dim - 0.5) * 2
+        xyd = np.concatenate([xys_scaled, depth], axis=1)
+        return torch.from_numpy(xyd).to(torch.float32)
+
     def render_views(self, frames, poses):
+        src_frame = frames[0]
+        scale_factor = 1.0 / self.scale_factor
+        # scale_factor = torch.tensor([1.0])
+
         tgt_img_np_list = []
         tgt_disp_np_list = []
+
         for frame, pose in zip(frames[1:], poses):
             G_tgt_src = pose.unsqueeze(0).to(self.mpi_all_rgb_src.device)
 
@@ -209,7 +309,7 @@ class VideoGenerator:
                 self.disparity_all_src, G_tgt_src,
                 self.K_inv, self.K,
                 scale=0,
-                scale_factor=torch.tensor([1.0]).to(G_tgt_src.device)
+                scale_factor=scale_factor.to(G_tgt_src.device)
             )
             tgt_imgs_syn = render_results["tgt_imgs_syn"]
             tgt_disparity_syn = render_results["tgt_disparity_syn"]
@@ -220,11 +320,11 @@ class VideoGenerator:
             tgt_img_np_list.append(tgt_img_np)
             tgt_disp_np_list.append(tgt_disp_np)
 
-            imwrite(self.output_dir / f"{frame.seq_id}.{frame.name}.pred.jpg", tgt_img_np)
+            imwrite(self.output_dir / f"{frame.seq_id}.{src_frame.timestamp}.{frame.name}.pred.jpg", tgt_img_np)
 
         # save GT images
         for frame in frames:
-            imwrite(self.output_dir / f"{frame.seq_id}.{frame.name}.gt.jpg", self.resize(imread(frame.image_file)))
+            imwrite(self.output_dir / f"{frame.seq_id}.{src_frame.timestamp}.{frame.name}.gt.jpg", self.resize(imread(frame.image_file)))
 
 
 def main():
@@ -271,27 +371,30 @@ def main():
     logger.handlers = [stream_handler]
     logger.propagate = False
 
+    config["data.path"] = args.data_path
     config["logger"] = logger
     config["tb_writer"] = None  # SummaryWriter(args.output_dir)
     config["data.per_gpu_batch_size"] = 1
 
     synthesis_task = SynthesisTask(config=config, logger=logger, is_val=True)
 
-    predictor = VideoGenerator(synthesis_task, config, config["logger"], args.output_dir)
-
-    split = load_test_split()
+    mode = "test"
+    split = load_test_split(mode)
     samples = create_test_set(args.data_path, split)
+
+    seq_data_path = Path(args.data_path) / f"{mode}.pickle"
+    with open(seq_data_path, "rb") as f:
+        seq_data = pickle.load(f)
+
+    predictor = Predictor(synthesis_task, config, seq_data, mode, args.output_dir)
 
     with torch.no_grad():
         for frames in tqdm(samples):
             # load source image
             if not frames[0].image_file.exists():
                 continue
-            img = imread(frames[0].image_file)
-            img = predictor.resize(img)
-            img = torch.from_numpy(img).cuda().permute(2, 0, 1).contiguous().unsqueeze(0) / 255.0
             tgts_poses = predictor.traj_generation(frames)
-            predictor.infer_network(img, frames)
+            predictor.infer_network(frames)
             predictor.render_views(frames, tgts_poses)
 
 
