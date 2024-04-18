@@ -320,11 +320,11 @@ class Predictor:
             tgt_img_np_list.append(tgt_img_np)
             tgt_disp_np_list.append(tgt_disp_np)
 
-            imwrite(self.output_dir / f"{frame.seq_id}.{src_frame.timestamp}.{frame.name}.pred.jpg", tgt_img_np, quality=95)
+            imwrite(self.output_dir / f"{frame.seq_id}.{src_frame.timestamp}.{frame.name}.pred.png", tgt_img_np)
 
         # save GT images
         for frame in frames:
-            imwrite(self.output_dir / f"{frame.seq_id}.{src_frame.timestamp}.{frame.name}.gt.jpg", self.resize(imread(frame.image_file)), quality=95)
+            imwrite(self.output_dir / f"{frame.seq_id}.{src_frame.timestamp}.{frame.name}.gt.png", self.resize(imread(frame.image_file)))
 
 
 def main():
